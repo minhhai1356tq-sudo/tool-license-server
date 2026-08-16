@@ -137,6 +137,43 @@ async def download_tool(token: str):
         media_type="application/octet-stream"
     )
 
+# ========== API MỚI: XÁC THỰC TOKEN ==========
+@app.post("/verify_session")
+async def verify_session(request: dict):
+    token = request.get('token')
+    machine_id = request.get('machine_id')
+    
+    if not token or not machine_id:
+        return JSONResponse(
+            status_code=400,
+            content={"valid": False, "message": "Missing token or machine_id"}
+        )
+    
+    # Kiểm tra token có tồn tại không
+    if token not in download_tokens:
+        return JSONResponse(
+            status_code=400,
+            content={"valid": False, "message": "Invalid token"}
+        )
+    
+    token_data = download_tokens[token]
+    
+    # Kiểm tra token còn hạn không
+    if token_data['expires_at'] < datetime.now():
+        del download_tokens[token]
+        return JSONResponse(
+            status_code=400,
+            content={"valid": False, "message": "Token expired"}
+        )
+    
+    # Token hợp lệ
+    return {
+        "valid": True,
+        "message": "✅ Session verified",
+        "key": token_data.get('key')
+    }
+# ============================================
+
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
