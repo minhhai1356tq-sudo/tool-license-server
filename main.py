@@ -7,14 +7,15 @@ from psycopg2.extras import RealDictCursor
 import os
 
 app = FastAPI(title="Tool License API")
-
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 def get_db():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-download_tokens = {}
+# ✅ FIX: Tách thành 2 dict riêng
+download_tokens = {}   # token tạm để tải file (xóa sau khi tải)
+session_tokens = {}    # token dài hạn để verify (tồn tại suốt session)
 
 def init_db():
     conn = get_db()
@@ -43,74 +44,68 @@ def root():
 @app.post("/check_key")
 async def check_key(request: dict):
     key = request.get('key', '').upper().strip()
-    
+
     if not key:
         raise HTTPException(status_code=400, detail="Missing key")
-    
+
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
     cur.execute("""
         SELECT key, status, expires_at, used_at, file_version
-        FROM keys
-        WHERE key = %s
+        FROM keys WHERE key = %s
     """, (key,))
-    
     key_info = cur.fetchone()
     cur.close()
-    
+
     if not key_info:
         conn.close()
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": "Key không tồn tại!"}
-        )
-    
+        return JSONResponse(status_code=400, content={"valid": False, "message": "Key không tồn tại!"})
+
     if key_info['status'] != 'active':
         conn.close()
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": f"Key đã {key_info['status']}!"}
-        )
-    
+        return JSONResponse(status_code=400, content={"valid": False, "message": f"Key đã {key_info['status']}!"})
+
     if key_info['expires_at'] and key_info['expires_at'] < datetime.now():
         conn.close()
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": "Key đã hết hạn!"}
-        )
-    
+        return JSONResponse(status_code=400, content={"valid": False, "message": "Key đã hết hạn!"})
+
     cur = conn.cursor()
     cur.execute("""
-        UPDATE keys
-        SET status = 'used', used_at = CURRENT_TIMESTAMP
+        UPDATE keys SET status = 'used', used_at = CURRENT_TIMESTAMP
         WHERE key = %s AND status = 'active'
         AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
         RETURNING key
     """, (key,))
-    
     row = cur.fetchone()
     conn.commit()
     cur.close()
     conn.close()
-    
+
     if not row:
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": "Lỗi khi xác nhận key!"}
-        )
-    
-    token = secrets.token_urlsafe(32)
-    download_tokens[token] = {
+        return JSONResponse(status_code=400, content={"valid": False, "message": "Lỗi khi xác nhận key!"})
+
+    # ✅ FIX: Tạo 2 token riêng
+    download_token = secrets.token_urlsafe(32)   # chỉ dùng để tải file
+    session_token = secrets.token_urlsafe(32)    # dùng để verify mỗi lần mở tool
+
+    download_tokens[download_token] = {
         'key': key,
+        'session_token': session_token,
         'expires_at': datetime.now() + timedelta(minutes=5)
     }
-    
+
+    # Session token tồn tại lâu hơn (ví dụ 30 ngày)
+    session_tokens[session_token] = {
+        'key': key,
+        'expires_at': datetime.now() + timedelta(days=30)
+    }
+
     return {
         "valid": True,
         "message": "✅ Key hợp lệ!",
-        "token": token,
-        "url": f"/download_tool?token={token}",
+        "token": download_token,      # launcher dùng để tải
+        "session_token": session_token,  # launcher truyền vào tool.exe
+        "url": f"/download_tool?token={download_token}",
         "version": key_info.get('file_version', 'v2.1.0')
     }
 
@@ -118,61 +113,40 @@ async def check_key(request: dict):
 async def download_tool(token: str):
     if token not in download_tokens:
         raise HTTPException(status_code=400, detail="Invalid token")
-    
+
     token_data = download_tokens[token]
-    
+
     if token_data['expires_at'] < datetime.now():
         del download_tokens[token]
         raise HTTPException(status_code=400, detail="Token đã hết hạn!")
-    
-    del download_tokens[token]
-    
+
+    del download_tokens[token]  # xóa download token sau khi tải xong
+
     tool_file = "files/tool_v2.1.0.exe"
     if not os.path.exists(tool_file):
         raise HTTPException(status_code=404, detail="File tool không tồn tại!")
-    
-    return FileResponse(
-        path=tool_file,
-        filename="tool.exe",
-        media_type="application/octet-stream"
-    )
 
-# ========== API MỚI: XÁC THỰC TOKEN ==========
+    return FileResponse(path=tool_file, filename="tool.exe", media_type="application/octet-stream")
+
 @app.post("/verify_session")
 async def verify_session(request: dict):
     token = request.get('token')
     machine_id = request.get('machine_id')
-    
+
     if not token or not machine_id:
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": "Missing token or machine_id"}
-        )
-    
-    # Kiểm tra token có tồn tại không
-    if token not in download_tokens:
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": "Invalid token"}
-        )
-    
-    token_data = download_tokens[token]
-    
-    # Kiểm tra token còn hạn không
+        return JSONResponse(status_code=400, content={"valid": False, "message": "Missing token or machine_id"})
+
+    # ✅ FIX: Kiểm tra session_tokens thay vì download_tokens
+    if token not in session_tokens:
+        return JSONResponse(status_code=400, content={"valid": False, "message": "Invalid session token"})
+
+    token_data = session_tokens[token]
+
     if token_data['expires_at'] < datetime.now():
-        del download_tokens[token]
-        return JSONResponse(
-            status_code=400,
-            content={"valid": False, "message": "Token expired"}
-        )
-    
-    # Token hợp lệ
-    return {
-        "valid": True,
-        "message": "✅ Session verified",
-        "key": token_data.get('key')
-    }
-# ============================================
+        del session_tokens[token]
+        return JSONResponse(status_code=400, content={"valid": False, "message": "Session expired"})
+
+    return {"valid": True, "message": "✅ Session verified", "key": token_data.get('key')}
 
 @app.get("/health")
 def health_check():
